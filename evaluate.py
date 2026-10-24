@@ -1,4 +1,4 @@
-from ragas.run_config import RunConfig
+
 import json
 import os
 from pathlib import Path
@@ -14,6 +14,7 @@ from ragas import evaluate
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.llms import LangchainLLMWrapper
 from ragas.metrics import faithfulness, answer_relevancy
+from ragas.run_config import RunConfig
 
 from generator import generate_answer
 from retrieval import search_documents
@@ -68,15 +69,16 @@ def run_evaluation():
     evaluator_chat_model = ChatGoogleGenerativeAI(
         model=GEMINI_MODEL,
         google_api_key=api_key,
-        temperature=0
     )
 
-    evaluator_llm = LangchainLLMWrapper(evaluator_chat_model)
+    evaluator_llm = LangchainLLMWrapper(
+        evaluator_chat_model
+    )
 
     # Configure Google embeddings for answer relevancy.
     evaluator_embedding_model = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
-        google_api_key=api_key
+        google_api_key=api_key,
     )
 
     evaluator_embeddings = LangchainEmbeddingsWrapper(
@@ -88,14 +90,22 @@ def run_evaluation():
     contexts = []
     ground_truths = []
 
-    print(f"Evaluating {len(evaluation_data)} questions...\n")
+    print(
+        f"Evaluating {len(evaluation_data)} questions...\n"
+    )
 
+    # Generate answers and collect retrieved context.
     for index, item in enumerate(evaluation_data, start=1):
         question = item["question"]
 
-        print(f"[{index}/{len(evaluation_data)}] {question}")
+        print(
+            f"[{index}/{len(evaluation_data)}] {question}"
+        )
 
-        retrieved = search_documents(question, top_k=5)
+        retrieved = search_documents(
+            question,
+            top_k=5,
+        )
 
         context = [
             match["text"]
@@ -105,7 +115,10 @@ def run_evaluation():
         if not context:
             print("Warning: no passages retrieved.")
 
-        answer = generate_answer(question, top_k=5)
+        answer = generate_answer(
+            question,
+            top_k=5,
+        )
 
         questions.append(question)
         answers.append(answer)
@@ -115,29 +128,41 @@ def run_evaluation():
         print(f"Retrieved passages: {len(context)}")
         print(f"Answer: {answer[:250]}...\n")
 
+    # Build the dataset expected by RAGAS.
     dataset = Dataset.from_dict({
         "question": questions,
         "answer": answers,
         "contexts": contexts,
-        "ground_truth": ground_truths
+        "ground_truth": ground_truths,
     })
 
     print("Running RAGAS metrics with Gemini...")
 
-    results = evaluate(
-    dataset=dataset,
-    metrics=[faithfulness, answer_relevancy],
-    llm=evaluator_llm,
-    embeddings=evaluator_embeddings,
-    run_config=RunConfig(
+    # Limit concurrency and retry transient failures.
+    run_config = RunConfig(
         max_workers=2,
         timeout=180,
-        max_retries=3
+        max_retries=3,
     )
-)
 
+    results = evaluate(
+        dataset=dataset,
+        metrics=[
+            faithfulness,
+            answer_relevancy,
+        ],
+        llm=evaluator_llm,
+        embeddings=evaluator_embeddings,
+        run_config=run_config,
+    )
+
+    # Save evaluation results.
     results_df = results.to_pandas()
-    results_df.to_csv(OUTPUT_FILE, index=False)
+    results_df.to_csv(
+        OUTPUT_FILE,
+        index=False,
+        encoding="utf-8",
+    )
 
     print("\nEvaluation complete!")
     print(f"Results saved to: {OUTPUT_FILE.resolve()}")
@@ -150,18 +175,33 @@ def run_evaluation():
 
     if metric_columns:
         print("\nAverage scores:")
-        print(results_df[metric_columns].mean().round(3))
+        print(
+            results_df[metric_columns]
+            .mean()
+            .round(3)
+        )
+
+        print("\nValid scores per metric:")
+        print(
+            results_df[metric_columns]
+            .count()
+        )
 
     print("\nPer-question results:")
-    print(results_df)
+    print(results_df.to_string(index=False))
 
 
 if __name__ == "__main__":
     try:
         run_evaluation()
+
+    except KeyboardInterrupt:
+        print("\nEvaluation interrupted by user.")
+
     except Exception as error:
         print(f"\nEvaluation failed: {error}")
         print(
             "\nCheck your Gemini API key, model availability, "
-            "network connection, and installed package versions."
+            "internet connection, RAGAS version, and package "
+            "compatibility."
         )
