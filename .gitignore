@@ -1,0 +1,35 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local vector database
+chroma_db/
+
+# Uploaded and private research documents
+data/*.pdf
+uploads/
+!data/.gitkeep
+
+# Generated evaluation results
+evaluation_results.csv
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/

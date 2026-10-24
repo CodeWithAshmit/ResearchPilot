@@ -1,0 +1,10 @@
+streamlit
+pandas
+chromadb
+sentence-transformers
+PyMuPDF
+python-dotenv
+google-genai
+langchain-google-genai
+datasets
+ragas
