@@ -1,4 +1,5 @@
 import html
+import hashlib
 from pathlib import Path
 
 import pandas as pd
@@ -263,6 +264,12 @@ if "messages" not in st.session_state:
 if "last_indexed_file" not in st.session_state:
     st.session_state.last_indexed_file = None
 
+if "uploader_version" not in st.session_state:
+    st.session_state.uploader_version = 0
+
+if "confirm_clear_all" not in st.session_state:
+    st.session_state.confirm_clear_all = False
+
 # --------------------------------------------------
 # HELPERS
 # --------------------------------------------------
@@ -280,6 +287,50 @@ def get_indexed_documents():
         return documents
     except Exception:
         return {}
+
+
+
+def sha256_bytes(file_bytes: bytes) -> str:
+    """Return a stable fingerprint for the exact contents of a PDF."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def find_duplicate_pdf(file_bytes: bytes):
+    """Find identical PDFs among saved files and any indexed hash metadata."""
+    uploaded_hash = sha256_bytes(file_bytes)
+
+    # Compare against PDFs already saved locally. This also detects files
+    # uploaded under a different filename, as long as the original PDF exists.
+    for existing_pdf in DATA_DIR.glob("*.pdf"):
+        try:
+            if sha256_bytes(existing_pdf.read_bytes()) == uploaded_hash:
+                return existing_pdf.name
+        except OSError:
+            continue
+
+    # Also support hashes already stored in ChromaDB by newer indexers.
+    try:
+        records = collection.get(include=["metadatas"])
+        for metadata in records.get("metadatas") or []:
+            if metadata and metadata.get("file_hash") == uploaded_hash:
+                return metadata.get("source", "an existing document")
+    except Exception:
+        pass
+
+    return None
+
+
+def clear_all_documents():
+    """Delete all ChromaDB records and saved PDFs used by this app."""
+    records = collection.get()
+    ids = records.get("ids") or []
+    if ids:
+        # Delete in batches to avoid very large delete requests.
+        for start in range(0, len(ids), 500):
+            collection.delete(ids=ids[start:start + 500])
+
+    for pdf_path in DATA_DIR.glob("*.pdf"):
+        pdf_path.unlink(missing_ok=True)
 
 
 def similarity_badge(similarity):
@@ -386,6 +437,7 @@ with st.sidebar:
         "Choose a PDF",
         type=["pdf"],
         label_visibility="collapsed",
+        key=f"pdf_uploader_{st.session_state.uploader_version}",
     )
 
     if st.button(
@@ -396,20 +448,72 @@ with st.sidebar:
     ):
         pdf_name = Path(uploaded_file.name).name
         pdf_path = DATA_DIR / pdf_name
+        file_bytes = uploaded_file.getvalue()
 
-        try:
-            with open(pdf_path, "wb") as file:
-                file.write(uploaded_file.getvalue())
+        duplicate_source = find_duplicate_pdf(file_bytes)
 
-            with st.spinner("Extracting text, embedding, and indexing..."):
-                index_pdf(pdf_path)
+        if duplicate_source:
+            st.warning(
+                f"This PDF has already been added as **{duplicate_source}**. "
+                "Duplicate upload was rejected."
+            )
+        else:
+            try:
+                # Do not silently overwrite an indexed file with the same name.
+                if pdf_path.exists():
+                    st.error(
+                        f"A file named **{pdf_name}** already exists. "
+                        "Clear the existing library or rename the new PDF."
+                    )
+                else:
+                    pdf_path.write_bytes(file_bytes)
 
-            st.session_state.last_indexed_file = pdf_name
-            st.success(f"Indexed {pdf_name}")
-            st.rerun()
+                    with st.spinner("Extracting text, embedding, and indexing..."):
+                        result = index_pdf(pdf_path)
 
-        except Exception as error:
-            st.error(f"Indexing failed: {error}")
+                    # A retrieval implementation may return a status. Keep
+                    # compatibility with versions where index_pdf returns None.
+                    if isinstance(result, dict) and result.get("status") == "duplicate":
+                        pdf_path.unlink(missing_ok=True)
+                        st.warning(
+                            f"This PDF is already indexed as "
+                            f"**{result.get('source', 'an existing document')}**."
+                        )
+                    else:
+                        # Persist the fingerprint in ChromaDB metadata so duplicate
+                        # detection still works if the local PDF is unavailable later.
+                        indexed_records = collection.get(include=["metadatas"])
+                        update_ids = []
+                        update_metadatas = []
+
+                        for record_id, metadata in zip(
+                            indexed_records.get("ids") or [],
+                            indexed_records.get("metadatas") or [],
+                        ):
+                            if metadata and metadata.get("source") == pdf_name:
+                                updated_metadata = dict(metadata)
+                                updated_metadata["file_hash"] = sha256_bytes(file_bytes)
+                                update_ids.append(record_id)
+                                update_metadatas.append(updated_metadata)
+
+                        if update_ids:
+                            collection.update(
+                                ids=update_ids,
+                                metadatas=update_metadatas,
+                            )
+
+                        st.session_state.last_indexed_file = pdf_name
+                        st.success(f"Indexed {pdf_name}")
+                        st.rerun()
+
+            except Exception as error:
+                # Avoid leaving an unindexed PDF behind after an indexing error.
+                try:
+                    if pdf_path.exists():
+                        pdf_path.unlink()
+                except OSError:
+                    pass
+                st.error(f"Indexing failed: {error}")
 
     st.divider()
     st.markdown("### Library")
@@ -436,6 +540,30 @@ with st.sidebar:
     if st.button("Clear chat history", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
+
+    st.divider()
+    st.markdown("### Data management")
+    st.caption("Remove all indexed documents and saved PDF files.")
+
+    clear_confirmation = st.checkbox(
+        "I understand this permanently deletes all documents",
+        key=f"confirm_clear_all_{st.session_state.uploader_version}",
+    )
+
+    if st.button(
+        "🗑️ Clear all data",
+        use_container_width=True,
+        disabled=not clear_confirmation,
+    ):
+        try:
+            clear_all_documents()
+            st.session_state.messages = []
+            st.session_state.last_indexed_file = None
+            st.session_state.uploader_version += 1
+            st.success("All indexed documents and saved PDFs have been deleted.")
+            st.rerun()
+        except Exception as error:
+            st.error(f"Could not clear all data: {error}")
 
     st.caption("Answers are generated from retrieved document evidence.")
 
